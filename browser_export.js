@@ -20,25 +20,29 @@ function dateBound(value, end = false) {
   if (end) d.setTime(d.getTime() + 86400000);
   return d.toISOString();
 }
-export async function browserExport(input, progress, signal) {
+export function createSession(webhook, transport = null) {
   let base;
-  try { base = new URL(input.webhook.trim()); } catch { throw Error('Введите полный HTTPS-адрес входящего вебхука.'); }
+  try { base = new URL(webhook.trim()); } catch { throw Error('Введите полный HTTPS-адрес входящего вебхука.'); }
   if (base.protocol !== 'https:' || base.username || base.password || base.search || base.hash || !/^\/rest\/\d+\/[\w-]+\/?$/.test(base.pathname)) throw Error('Неверный формат вебхука: нужен https://портал/rest/USER/SECRET/.');
   base.pathname = base.pathname.replace(/\/?$/, '/');
   const origin = base.origin;
-  const low = input.min_duration === '' ? null : Number(input.min_duration);
-  const high = input.max_duration === '' ? null : Number(input.max_duration);
-  if ([low, high].some(n => n !== null && (!Number.isInteger(n) || n < 0)) || low !== null && high !== null && low > high) throw Error('Проверьте диапазон длительности.');
-  const since = dateBound(input.date_from), until = dateBound(input.date_to, true);
-  if (since && until && since >= until) throw Error('Начало периода должно быть раньше окончания.');
-  const callId = input.call.trim() ? parseCall(input.call.trim()) : null;
-  const phoneFilter = input.phone.replace(/\D/g, '');
-  if (input.phone.trim() && !phoneFilter) throw Error('Телефон должен содержать цифры.');
   let last = 0;
+  let progress = () => {}, signal;
+  let users = new Map(), cached = null;
   async function api(method, params) {
+    if (transport) {
+      await sleep(Math.max(0, 1000 - (Date.now() - last)));
+      if (signal?.aborted) throw Error('Выгрузка остановлена.');
+      last = Date.now();
+      return transport(method, params, signal);
+    }
+    return directApi(method, params);
+  }
+  async function directApi(method, params) {
     for (let attempt = 0; attempt <= 5; attempt++) {
       if (signal?.aborted) throw Error('Выгрузка остановлена.');
       await sleep(Math.max(0, 1000 - (Date.now() - last))); last = Date.now();
+      if (signal?.aborted) throw Error('Выгрузка остановлена.');
       let response;
       try {
         response = await fetch(base.href + method + '.json', {
@@ -48,14 +52,13 @@ export async function browserExport(input, progress, signal) {
         });
       } catch {
         if (signal?.aborted) throw Error('Выгрузка остановлена.');
-        throw Error('Браузер не смог обратиться к Битрикс24. Возможны запрет CORS, сеть или тайм-аут. Используйте start_web.cmd для локального режима.');
+        throw Error('Нет связи с Битрикс24. Возможны CORS, сеть или тайм-аут. Попробуйте локальный режим start_web.cmd.');
       }
       let data; try { data = await response.json(); } catch { throw Error('Портал вернул ответ в неожиданном формате.'); }
       const retry = [429, 500, 502, 503, 504].includes(response.status) || ['QUERY_LIMIT_EXCEEDED', 'OPERATION_TIME_LIMIT', 'INTERNAL_SERVER_ERROR'].includes(data.error);
       if (retry && attempt < 5) { progress('Портал временно ограничил запросы. Повторяем…'); await sleep(Math.min(60000, 1000 * 2 ** attempt)); continue; }
       if (!response.ok || data.error) {
-        // Raw server text can include sensitive information. Only fixed messages leave here.
-        const error = Error('Запрос отклонён порталом. Проверьте вебхук, права CRM, телефонии и пользователей.');
+        const error = Error('Запрос отклонён порталом. Проверьте вебхук и права CRM, телефонии и пользователей.');
         error.api = true; throw error;
       }
       if (!('result' in data)) throw Error('В ответе отсутствуют данные.');
@@ -65,7 +68,7 @@ export async function browserExport(input, progress, signal) {
   async function* pages(method, params) {
     let start = 0; const seen = new Set();
     while (true) {
-      if (seen.has(start)) throw Error('Портал повторяет страницу данных. Выгрузка остановлена.');
+      if (seen.has(start)) throw Error('Портал повторяет страницу данных.');
       seen.add(start);
       const d = await api(method, {...params, start});
       if (!Array.isArray(d.result)) throw Error('Портал вернул неожиданный список.');
@@ -75,22 +78,55 @@ export async function browserExport(input, progress, signal) {
       if (!Number.isSafeInteger(start) || start < 0) throw Error('Некорректная пагинация портала.');
     }
   }
-  const users = new Map(); progress('Получаем список менеджеров…');
-  for await (const u of pages('user.get', {sort: 'ID', order: 'ASC'})) users.set(String(u.ID), [u.LAST_NAME, u.NAME, u.SECOND_NAME].filter(Boolean).join(' '));
-  const f = {TYPE_ID: 2};
-  if (input.manager.trim()) {
-    const tokens = input.manager.toLocaleLowerCase().split(/\s+/).filter(Boolean);
-    const ids = [...users].filter(([, n]) => tokens.every(t => n.toLocaleLowerCase().includes(t))).map(([id]) => id);
-    if (!ids.length) throw Error('Менеджер не найден. Проверьте ФИО и доступные права.');
-    f.RESPONSIBLE_ID = ids;
-  }
-  if (since) f['>=START_TIME'] = since;
-  if (until) f['<START_TIME'] = until;
-  if (callId) f.ID = callId;
+  return {
+    async verify(onProgress = () => {}, abortSignal) {
+      progress = onProgress; signal = abortSignal;
+      users = new Map(); cached = null;
+      progress('Проверяем подключение и доступ к списку сотрудников…');
+      for await (const u of pages('user.get', {sort: 'ID', order: 'ASC'})) users.set(String(u.ID), [u.LAST_NAME, u.NAME, u.SECOND_NAME].filter(Boolean).join(' '));
+      await api('crm.activity.list', {filter: {TYPE_ID: 2, ID: 0}, select: ['ID'], start: 0});
+      await api('voximplant.statistic.get', {FILTER: {CRM_ACTIVITY_ID: 0}, start: 0});
+      return {users: users.size};
+    },
+    async discover(input, onProgress = () => {}, abortSignal) {
+      progress = onProgress; signal = abortSignal; cached = null;
+      const since = dateBound(input.date_from), until = dateBound(input.date_to, true);
+      if (!since || !until || since >= until) throw Error('Выберите корректный диапазон дат.');
+      const calls = [], seen = new Set(), counts = new Map();
+      const f = {TYPE_ID: 2, '>=START_TIME': since, '<START_TIME': until};
+      for await (const a of pages('crm.activity.list', {filter: f, order: {ID: 'ASC'}, select: ['*', 'COMMUNICATIONS']})) {
+        if (seen.has(String(a.ID))) continue;
+        seen.add(String(a.ID)); calls.push(a);
+        const id = String(a.RESPONSIBLE_ID || '');
+        if (id && id !== '0') counts.set(id, (counts.get(id) || 0) + 1);
+        progress(`Найдено звонков за период: ${calls.length}. Тексты расшифровок пока не запрашиваем.`);
+      }
+      cached = {key: `${input.date_from}|${input.date_to}`, calls};
+      return [...counts].map(([id,count]) => ({id, count, name: users.get(id) || `Сотрудник #${id}`})).sort((a,b) => a.name.localeCompare(b.name, 'ru'));
+    },
+    async export(input, onProgress = () => {}, abortSignal) {
+      progress = onProgress; signal = abortSignal;
+      if (!cached || cached.key !== `${input.date_from}|${input.date_to}`) throw Error('Сначала загрузите менеджеров за выбранный период.');
+      const selected = new Set((input.manager_ids || []).map(String));
+      if (!selected.size) throw Error('Отметьте хотя бы одного менеджера.');
+      const candidates = cached.calls.filter(a => selected.has(String(a.RESPONSIBLE_ID)));
+      return runExport(input, candidates);
+    }
+  };
+  async function runExport(input, candidates) {
+  const low = input.min_duration === '' ? null : Number(input.min_duration);
+  const high = input.max_duration === '' ? null : Number(input.max_duration);
+  if ([low, high].some(n => n !== null && (!Number.isInteger(n) || n < 0)) || low !== null && high !== null && low > high) throw Error('Проверьте диапазон длительности.');
+  const since = dateBound(input.date_from), until = dateBound(input.date_to, true);
+  if (since && until && since >= until) throw Error('Начало периода должно быть раньше окончания.');
+  const callId = input.call.trim() ? parseCall(input.call.trim()) : null;
+  const phoneFilter = input.phone.replace(/\D/g, '');
+  if (input.phone.trim() && !phoneFilter) throw Error('Телефон должен содержать цифры.');
   const fields = ['activity_id','activity_url','manager_id','manager_name','start_time','phone','duration_seconds','duration_source','call_ids','record_file_ids','owner_type_id','owner_id','subject','transcript_status','error_code','transcription'];
   const lines = [fields.map(csvCell).join(';')];
   const seen = new Set(); let checked = 0, ready = 0, missing = 0, errors = 0;
-  for await (const a of pages('crm.activity.list', {filter: f, order: {ID: 'ASC'}, select: ['*', 'COMMUNICATIONS']})) {
+  for (const a of candidates) {
+    if (callId && String(a.ID) !== String(callId)) continue;
     if (seen.has(String(a.ID))) continue; seen.add(String(a.ID)); checked++;
     progress(`Проверено звонков: ${checked}. С готовым текстом: ${ready}.`);
     const stats = []; for await (const s of pages('voximplant.statistic.get', {FILTER: {CRM_ACTIVITY_ID: a.ID}, SORT: 'ID', ORDER: 'ASC'})) stats.push(s);
@@ -110,6 +146,7 @@ export async function browserExport(input, progress, signal) {
     lines.push(row.map(csvCell).join(';')); ready++;
   }
   return {blob: new Blob(['\ufeff' + lines.join('\r\n') + '\r\n'], {type: 'text/csv;charset=utf-8'}), ready, checked, missing, errors};
+  }
 }
 function flatten(object, prefix = '') {
   const entries = [];
